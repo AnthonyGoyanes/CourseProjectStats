@@ -92,20 +92,34 @@ if "trained" not in st.session_state:
 def load_weather_csv(file) -> pd.DataFrame:
     """
     Handles two common NOAA layouts:
-      Layout A – header row 0 is the station meta-line, actual column names at row 1
-      Layout B – standard CSV with columns directly at row 0
-    Returns a clean DataFrame indexed by date with numeric weather columns.
+      Layout A – header row 0 is the station meta-line (may contain commas),
+                 actual column names are at row 1.
+      Layout B – standard CSV with column names directly at row 0.
+    Detects the layout by reading raw text lines — never lets pandas tokenize
+    the ambiguous first row, which avoids the 'Expected N fields, saw M' error.
     """
-    raw = pd.read_csv(file, nrows=3, header=None)
+    # Read raw bytes so we can seek back reliably regardless of file type
+    raw_bytes = file.read()
+    file.seek(0)
 
-    # Detect layout A: first cell is a long station description string
-    first_cell = str(raw.iloc[0, 0])
-    if len(first_cell) > 40 and any(x in first_cell.upper() for x in ["US", "STATION", "NWS"]):
-        file.seek(0)
-        df = pd.read_csv(file, header=1)
+    # Decode to text and split into lines for layout detection
+    text = raw_bytes.decode("utf-8", errors="replace")
+    lines = text.splitlines()
+
+    # Layout A heuristic: first line does NOT look like a CSV header.
+    # A header row will contain a recognisable date/weather keyword.
+    # A station meta-line looks like "BLACKSBURG ..., VA US (USC00440766)".
+    HEADER_KEYWORDS = {"date", "tmax", "tmin", "tavg", "prcp", "snow", "snwd",
+                       "datetime", "dt", "temp", "precip"}
+    first_line_lower = lines[0].lower() if lines else ""
+    first_line_has_header_kw = any(kw in first_line_lower for kw in HEADER_KEYWORDS)
+
+    if not first_line_has_header_kw:
+        # Layout A — skip the station meta-line; real header is on row 1
+        df = pd.read_csv(io.StringIO(text), header=1, on_bad_lines="skip")
     else:
-        file.seek(0)
-        df = pd.read_csv(file, header=0)
+        # Layout B — standard header on row 0
+        df = pd.read_csv(io.StringIO(text), header=0, on_bad_lines="skip")
 
     # Normalise column names
     df.columns = [c.strip() for c in df.columns]
