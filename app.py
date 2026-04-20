@@ -1,11 +1,17 @@
 """
 Severe Weather Risk Prediction App
-===================================
-Plug-and-play ML pipeline that ingests:
-  1. A daily weather observations CSV  (NOAA GHCN format or similar)
-  2. A storm events CSV                 (NOAA Storm Events format or similar)
-…and trains a classifier to score the probability of a severe-weather event
-on any given day.
+====================================
+Upload a daily weather CSV + a storm events CSV → feature engineering →
+ML classifier → daily severe-weather risk score.
+
+Fixes applied vs v1:
+  • Model instances created fresh on every train call (no singleton reuse)
+  • Training window auto-filtered to the storm-record overlap period
+    (avoids labelling pre-record years as 0 / no storm)
+  • Decision threshold auto-tuned from the PR curve (maximises F1)
+  • VarianceThreshold removes zero-variance features before imputation
+  • sample_weight passed via fit() for full sklearn version compatibility
+  • LR uses saga solver (better convergence on wide feature sets)
 """
 
 import io
@@ -17,27 +23,20 @@ import pandas as pd
 import streamlit as st
 import plotly.express as px
 import plotly.graph_objects as go
-from plotly.subplots import make_subplots
 
-from sklearn.ensemble import (
-    RandomForestClassifier,
-    GradientBoostingClassifier,
-    HistGradientBoostingClassifier,
-)
+from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
 from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import StandardScaler
 from sklearn.pipeline import Pipeline
-from sklearn.model_selection import train_test_split, cross_val_score, StratifiedKFold
+from sklearn.model_selection import train_test_split, StratifiedKFold, cross_val_score
 from sklearn.metrics import (
-    classification_report,
-    confusion_matrix,
-    roc_auc_score,
-    roc_curve,
-    precision_recall_curve,
-    average_precision_score,
+    classification_report, confusion_matrix,
+    roc_auc_score, roc_curve,
+    precision_recall_curve, average_precision_score,
 )
-from sklearn.inspection import permutation_importance
 from sklearn.impute import SimpleImputer
+from sklearn.feature_selection import VarianceThreshold
+from sklearn.utils.class_weight import compute_sample_weight
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -50,133 +49,95 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Custom CSS
-# ─────────────────────────────────────────────────────────────────────────────
 st.markdown("""
 <style>
-    .metric-card {
-        background: linear-gradient(135deg, #1e3a5f 0%, #2d6a9f 100%);
-        border-radius: 12px;
-        padding: 16px;
-        color: white;
-        text-align: center;
-        box-shadow: 0 4px 15px rgba(0,0,0,0.2);
-    }
-    .risk-gauge-low    { color: #27ae60; font-size: 2rem; font-weight: bold; }
-    .risk-gauge-medium { color: #f39c12; font-size: 2rem; font-weight: bold; }
-    .risk-gauge-high   { color: #e74c3c; font-size: 2rem; font-weight: bold; }
-    .section-header {
-        border-left: 4px solid #2d6a9f;
-        padding-left: 12px;
-        margin-bottom: 8px;
-    }
-    div[data-testid="stExpander"] { border-radius: 8px; }
+    .risk-low    { color:#27ae60; font-size:2rem; font-weight:bold; }
+    .risk-medium { color:#f39c12; font-size:2rem; font-weight:bold; }
+    .risk-high   { color:#e74c3c; font-size:2rem; font-weight:bold; }
 </style>
 """, unsafe_allow_html=True)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SESSION STATE DEFAULTS
+# Session-state defaults
 # ─────────────────────────────────────────────────────────────────────────────
-for key in ["model", "feature_cols", "scaler", "df_features", "label_map",
-            "trained", "model_name", "threshold"]:
-    if key not in st.session_state:
-        st.session_state[key] = None
-if "trained" not in st.session_state:
+for _k in ["result", "df_features", "df_features_scored", "trained",
+           "df_weather", "df_storm"]:
+    if _k not in st.session_state:
+        st.session_state[_k] = None
+if st.session_state["trained"] is None:
     st.session_state["trained"] = False
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ── DATA LOADING ──────────────────────────────────────────────────────────────
+# Data loading
 # ─────────────────────────────────────────────────────────────────────────────
+_HEADER_KW = {"date", "tmax", "tmin", "tavg", "prcp", "snow", "snwd",
+              "datetime", "dt", "temp", "precip"}
+
+
 def load_weather_csv(file) -> pd.DataFrame:
     """
-    Handles two common NOAA layouts:
-      Layout A – header row 0 is the station meta-line (may contain commas),
-                 actual column names are at row 1.
-      Layout B – standard CSV with column names directly at row 0.
-    Detects the layout by reading raw text lines — never lets pandas tokenize
-    the ambiguous first row, which avoids the 'Expected N fields, saw M' error.
+    Accepts NOAA GHCN exports (station meta-line on row 0, header on row 1)
+    or any standard weather CSV.  Detects layout from raw text to avoid
+    pandas tokenisation errors on comma-containing station descriptions.
     """
-    # Read raw bytes so we can seek back reliably regardless of file type
     raw_bytes = file.read()
     file.seek(0)
-
-    # Decode to text and split into lines for layout detection
     text = raw_bytes.decode("utf-8", errors="replace")
     lines = text.splitlines()
+    first_lower = lines[0].lower() if lines else ""
+    has_header_kw = any(kw in first_lower for kw in _HEADER_KW)
+    header_row = 0 if has_header_kw else 1
 
-    # Layout A heuristic: first line does NOT look like a CSV header.
-    # A header row will contain a recognisable date/weather keyword.
-    # A station meta-line looks like "BLACKSBURG ..., VA US (USC00440766)".
-    HEADER_KEYWORDS = {"date", "tmax", "tmin", "tavg", "prcp", "snow", "snwd",
-                       "datetime", "dt", "temp", "precip"}
-    first_line_lower = lines[0].lower() if lines else ""
-    first_line_has_header_kw = any(kw in first_line_lower for kw in HEADER_KEYWORDS)
-
-    if not first_line_has_header_kw:
-        # Layout A — skip the station meta-line; real header is on row 1
-        df = pd.read_csv(io.StringIO(text), header=1, on_bad_lines="skip")
-    else:
-        # Layout B — standard header on row 0
-        df = pd.read_csv(io.StringIO(text), header=0, on_bad_lines="skip")
-
-    # Normalise column names
+    df = pd.read_csv(io.StringIO(text), header=header_row, on_bad_lines="skip")
     df.columns = [c.strip() for c in df.columns]
 
-    # Find the date column (case-insensitive)
-    date_col = next((c for c in df.columns if c.lower() in ["date", "datetime", "dt"]), None)
+    date_col = next(
+        (c for c in df.columns if c.lower() in ["date", "datetime", "dt"]), None
+    )
     if date_col is None:
-        raise ValueError("No date column found in weather CSV. "
-                         "Expected a column named 'Date', 'datetime', or 'dt'.")
+        raise ValueError(
+            "No date column found. Expected 'Date', 'datetime', or 'dt'."
+        )
     df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
-    df = df.dropna(subset=[date_col])
-    df = df.rename(columns={date_col: "date"})
-    df = df.sort_values("date").reset_index(drop=True)
+    df = df.dropna(subset=[date_col]).rename(columns={date_col: "date"})
 
-    # Shorten verbose column names
-    rename_map = {}
+    rename = {}
     for c in df.columns:
         cu = c.upper()
-        if "TAVG" in cu: rename_map[c] = "TAVG"
-        elif "TMAX" in cu: rename_map[c] = "TMAX"
-        elif "TMIN" in cu: rename_map[c] = "TMIN"
-        elif "PRCP" in cu: rename_map[c] = "PRCP"
-        elif "SNOW" in cu and "SNWD" not in cu: rename_map[c] = "SNOW"
-        elif "SNWD" in cu: rename_map[c] = "SNWD"
-    df = df.rename(columns=rename_map)
+        if   "TAVG" in cu:                      rename[c] = "TAVG"
+        elif "TMAX" in cu:                      rename[c] = "TMAX"
+        elif "TMIN" in cu:                      rename[c] = "TMIN"
+        elif "PRCP" in cu:                      rename[c] = "PRCP"
+        elif "SNOW" in cu and "SNWD" not in cu: rename[c] = "SNOW"
+        elif "SNWD" in cu:                      rename[c] = "SNWD"
+    df = df.rename(columns=rename)
 
-    # Coerce numeric columns
-    weather_cols = [c for c in df.columns if c != "date"]
-    for c in weather_cols:
-        df[c] = pd.to_numeric(df[c], errors="coerce")
+    for c in df.columns:
+        if c != "date":
+            df[c] = pd.to_numeric(df[c], errors="coerce")
 
-    return df
+    return df.sort_values("date").reset_index(drop=True)
 
 
 def load_storm_csv(file) -> pd.DataFrame:
-    """
-    Loads NOAA Storm Events export (or any CSV with EVENT_TYPE and BEGIN_DATE).
-    Returns a DataFrame with a clean 'date' column.
-    """
     df = pd.read_csv(file, low_memory=False)
     df.columns = [c.strip().upper() for c in df.columns]
 
-    # Flexible date column detection
     date_col = next(
-        (c for c in df.columns if c in ["BEGIN_DATE", "DATE", "BEGIN_DATETIME"]), None
+        (c for c in df.columns if c in ["BEGIN_DATE", "DATE", "BEGIN_DATETIME"]),
+        None,
     )
     if date_col is None:
-        raise ValueError("No date column found in storm CSV. "
-                         "Expected 'BEGIN_DATE', 'DATE', or 'BEGIN_DATETIME'.")
-
-    df["date"] = pd.to_datetime(df[date_col], errors="coerce")
+        raise ValueError(
+            "No date column found. Expected 'BEGIN_DATE', 'DATE', or 'BEGIN_DATETIME'."
+        )
+    df["date"] = pd.to_datetime(df[date_col], errors="coerce").dt.normalize()
     df = df.dropna(subset=["date"])
-    df["date"] = df["date"].dt.normalize()  # strip time → date only
 
-    event_col = next((c for c in df.columns if "EVENT_TYPE" in c), None)
-    if event_col:
-        df = df.rename(columns={event_col: "EVENT_TYPE"})
+    ev = next((c for c in df.columns if "EVENT_TYPE" in c), None)
+    if ev:
+        df = df.rename(columns={ev: "EVENT_TYPE"})
     else:
         df["EVENT_TYPE"] = "Unknown"
 
@@ -184,7 +145,7 @@ def load_storm_csv(file) -> pd.DataFrame:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ── FEATURE ENGINEERING ───────────────────────────────────────────────────────
+# Label builder
 # ─────────────────────────────────────────────────────────────────────────────
 SEVERE_TYPES = {
     "tornado", "hurricane", "typhoon", "blizzard",
@@ -197,201 +158,297 @@ SEVERE_TYPES = {
     "cold/wind chill", "frost/freeze",
 }
 
-def build_label(weather_df: pd.DataFrame, storm_df: pd.DataFrame,
-                severe_types: set, min_category: str = "any") -> pd.DataFrame:
+
+def build_label(
+    weather_df: pd.DataFrame,
+    storm_df: pd.DataFrame,
+    label_mode: str = "any",
+    filter_overlap: bool = True,
+) -> pd.DataFrame:
     """
-    Creates a binary target: 1 = severe event on that day, 0 = none.
-    min_category controls which event types count:
-      'any'     – all events in the storm data
-      'severe'  – only SEVERE_TYPES
+    Creates binary target: 1 = storm event recorded that day.
+
+    filter_overlap=True (strongly recommended): restricts the training window
+    to dates within the storm database's own coverage period.  Without this,
+    pre-record years are labelled 0 (no data != no storm), which drowns the
+    signal and collapses the positive rate from ~3% down to ~0.7%.
     """
-    if min_category == "severe":
-        events = storm_df[storm_df["EVENT_TYPE"].str.lower().isin(severe_types)]
+    if label_mode == "severe":
+        events = storm_df[storm_df["EVENT_TYPE"].str.lower().isin(SEVERE_TYPES)]
     else:
         events = storm_df
 
     event_dates = set(events["date"].dt.normalize())
-    weather_df = weather_df.copy()
-    weather_df["severe_event"] = weather_df["date"].isin(event_dates).astype(int)
-    return weather_df
+
+    df = weather_df.copy()
+    if filter_overlap:
+        storm_min = storm_df["date"].min()
+        storm_max = storm_df["date"].max()
+        df = df[(df["date"] >= storm_min) & (df["date"] <= storm_max)].copy()
+
+    df["severe_event"] = df["date"].isin(event_dates).astype(int)
+    return df.reset_index(drop=True)
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Feature engineering
+# ─────────────────────────────────────────────────────────────────────────────
 def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Full feature engineering pipeline:
-      1. Calendar features
-      2. Temperature-derived features
-      3. Lag features (1, 3, 7 days)
-      4. Rolling statistics (7-day, 14-day)
-      5. Trend features
-      6. Categorical encoding (month, season)
+    Full feature pipeline.  All rolling/lag features are computed on SHIFTED
+    series (shift(1)) so no future information leaks into the target.
     """
     df = df.copy().sort_values("date").reset_index(drop=True)
+    base = [c for c in ["TMAX", "TMIN", "TAVG", "PRCP", "SNOW", "SNWD"]
+            if c in df.columns]
 
-    # ── 1. Calendar ──────────────────────────────────────────────────────────
-    df["month"]      = df["date"].dt.month
-    df["day_of_year"]= df["date"].dt.dayofyear
-    df["week"]       = df["date"].dt.isocalendar().week.astype(int)
-    df["season"] = df["month"].map({
-        12:0, 1:0, 2:0,   # Winter
-         3:1, 4:1, 5:1,   # Spring
-         6:2, 7:2, 8:2,   # Summer
-         9:3,10:3,11:3,   # Autumn
-    })
-    # Cyclical encoding of month and day-of-year
+    # ── Calendar ─────────────────────────────────────────────────────────────
+    df["month"]       = df["date"].dt.month
+    df["day_of_year"] = df["date"].dt.dayofyear
+    df["week"]        = df["date"].dt.isocalendar().week.astype(int)
+    df["season"]      = df["month"].map(
+        {12:0,1:0,2:0, 3:1,4:1,5:1, 6:2,7:2,8:2, 9:3,10:3,11:3}
+    )
     df["month_sin"]   = np.sin(2 * np.pi * df["month"] / 12)
     df["month_cos"]   = np.cos(2 * np.pi * df["month"] / 12)
     df["doy_sin"]     = np.sin(2 * np.pi * df["day_of_year"] / 365)
     df["doy_cos"]     = np.cos(2 * np.pi * df["day_of_year"] / 365)
 
-    # ── 2. Temperature-derived ────────────────────────────────────────────────
-    base_cols = [c for c in ["TMAX","TMIN","TAVG","PRCP","SNOW","SNWD"] if c in df.columns]
-
+    # ── Temperature-derived ──────────────────────────────────────────────────
     if "TMAX" in df.columns and "TMIN" in df.columns:
-        df["temp_range"]   = df["TMAX"] - df["TMIN"]
-        df["temp_mean_est"]= (df["TMAX"] + df["TMIN"]) / 2
-    if "TAVG" in df.columns:
-        # Approximate heat index (simplified Rothfusz)
-        df["heat_index"] = df["TAVG"].apply(
-            lambda t: t + 0.33 * 0.06 * (t - 14.5) if pd.notna(t) and t > 60 else t
-        )
+        df["temp_range"]    = df["TMAX"] - df["TMIN"]
+        df["temp_mean_est"] = (df["TMAX"] + df["TMIN"]) / 2
+        df["tmax_extreme"]  = (df["TMAX"] > df["TMAX"].quantile(0.90)).astype(int)
+        df["tmin_extreme"]  = (df["TMIN"] < df["TMIN"].quantile(0.10)).astype(int)
+        df["temp_range_lag1"] = df["temp_range"].shift(1)
+        df["temp_swing"]    = (df["temp_range"] - df["temp_range"].shift(1)).abs()
+
+    if "TMAX" in df.columns:
+        df["tmax_lag1_delta"] = df["TMAX"] - df["TMAX"].shift(1)
+        df["tmax_lag2_delta"] = df["TMAX"] - df["TMAX"].shift(2)
+
     if "PRCP" in df.columns:
-        df["prcp_nonzero"] = (df["PRCP"] > 0).astype(int)
-        df["heavy_rain"]   = (df["PRCP"] > 1.0).astype(int)
-    if "SNOW" in df.columns:
-        df["snow_nonzero"] = (df["SNOW"] > 0).astype(int)
-
-    # ── 3. Lag features ───────────────────────────────────────────────────────
-    for col in base_cols:
-        for lag in [1, 2, 3, 7]:
-            df[f"{col}_lag{lag}"] = df[col].shift(lag)
-
-    # ── 4. Rolling statistics ─────────────────────────────────────────────────
-    for col in base_cols:
-        for window in [7, 14, 30]:
-            df[f"{col}_roll{window}_mean"] = df[col].shift(1).rolling(window).mean()
-            df[f"{col}_roll{window}_std"]  = df[col].shift(1).rolling(window).std()
-            df[f"{col}_roll{window}_max"]  = df[col].shift(1).rolling(window).max()
-
-    # ── 5. Trend features (difference from rolling mean) ─────────────────────
-    for col in ["TMAX", "TMIN", "PRCP"] if all(c in df.columns for c in ["TMAX","TMIN","PRCP"]) else []:
-        if f"{col}_roll7_mean" in df.columns:
-            df[f"{col}_dev7"]  = df[col] - df[f"{col}_roll7_mean"]
-            df[f"{col}_dev14"] = df[col] - df[f"{col}_roll14_mean"]
-
-    # ── 6. Consecutive-day counters ───────────────────────────────────────────
-    if "PRCP" in df.columns:
-        # days since last rain
+        df["prcp_nonzero"]    = (df["PRCP"] > 0).astype(int)
+        df["heavy_rain"]      = (df["PRCP"] > 1.0).astype(int)
+        df["extreme_rain"]    = (df["PRCP"] > 2.0).astype(int)
         df["days_since_rain"] = (
-            df["PRCP"]
-            .eq(0)
+            df["PRCP"].eq(0)
             .groupby((df["PRCP"] != 0).cumsum())
             .cumcount()
         )
+        df["prcp_5d_total"]   = df["PRCP"].shift(1).rolling(5).sum()
+
     if "SNOW" in df.columns:
+        df["snow_nonzero"]    = (df["SNOW"] > 0).astype(int)
         df["days_since_snow"] = (
-            df["SNOW"]
-            .eq(0)
+            df["SNOW"].eq(0)
             .groupby((df["SNOW"] != 0).cumsum())
             .cumcount()
         )
+
+    # ── Lag features ─────────────────────────────────────────────────────────
+    for col in base:
+        for lag in [1, 2, 3, 7]:
+            df[f"{col}_lag{lag}"] = df[col].shift(lag)
+
+    # ── Rolling statistics (shift(1) prevents leakage) ───────────────────────
+    for col in base:
+        s = df[col].shift(1)
+        for w in [7, 14, 30]:
+            df[f"{col}_roll{w}_mean"] = s.rolling(w).mean()
+            df[f"{col}_roll{w}_std"]  = s.rolling(w).std()
+            df[f"{col}_roll{w}_max"]  = s.rolling(w).max()
+
+    # ── Trend: deviation from rolling mean ───────────────────────────────────
+    for col in [c for c in ["TMAX", "TMIN", "PRCP"] if c in df.columns]:
+        if f"{col}_roll7_mean" in df.columns:
+            df[f"{col}_dev7"]  = df[col] - df[f"{col}_roll7_mean"]
+        if f"{col}_roll14_mean" in df.columns:
+            df[f"{col}_dev14"] = df[col] - df[f"{col}_roll14_mean"]
+
+    # ── Interactions ─────────────────────────────────────────────────────────
+    if "TMAX" in df.columns:
+        df["season_x_tmax"] = df["season"] * df["TMAX"]
+    if "PRCP" in df.columns:
+        df["season_x_prcp"] = df["season"] * df["PRCP"]
 
     return df
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ── MODEL TRAINING ────────────────────────────────────────────────────────────
+# Model factory  — ALWAYS returns a fresh, unfitted instance
 # ─────────────────────────────────────────────────────────────────────────────
-MODEL_REGISTRY = {
-    "Random Forest": RandomForestClassifier(
-        n_estimators=300, max_depth=12, min_samples_leaf=5,
-        class_weight="balanced", random_state=42, n_jobs=-1,
-    ),
-    "Gradient Boosting": HistGradientBoostingClassifier(
-        max_iter=300, max_depth=6, learning_rate=0.05,
-        class_weight="balanced", random_state=42,
-    ),
-    "Logistic Regression": LogisticRegression(
-        C=1.0, max_iter=1000, class_weight="balanced",
-        solver="lbfgs", random_state=42,
-    ),
-}
-
-
-def train_model(df: pd.DataFrame, model_name: str, test_size: float,
-                threshold: float):
-    target = "severe_event"
-    drop_cols = {target, "date"} | {c for c in df.columns if "EVENT_TYPE" in c.upper()}
-    feature_cols = [c for c in df.columns if c not in drop_cols]
-
-    X = df[feature_cols].copy()
-    y = df[target].copy()
-
-    # Drop columns that are entirely NaN — SimpleImputer silently removes them
-    # from the output array without adjusting the column list, which causes a
-    # shape mismatch when rebuilding the DataFrame.
-    all_nan_cols = [c for c in X.columns if X[c].isna().all()]
-    if all_nan_cols:
-        X = X.drop(columns=all_nan_cols)
-    feature_cols = X.columns.tolist()
-
-    # Impute remaining missing values — output shape now matches feature_cols
-    imputer = SimpleImputer(strategy="median")
-    X_imp = imputer.fit_transform(X)
-    X_imp = pd.DataFrame(X_imp, columns=feature_cols)
-
-    X_train, X_test, y_train, y_test = train_test_split(
-        X_imp, y, test_size=test_size, shuffle=False  # temporal split
-    )
-
-    model = MODEL_REGISTRY[model_name]
-
-    # Wrap Logistic Regression in scaler pipeline
-    if model_name == "Logistic Regression":
-        pipeline = Pipeline([
-            ("scaler", StandardScaler()),
-            ("clf", model),
-        ])
-        pipeline.fit(X_train, y_train)
-        probs  = pipeline.predict_proba(X_test)[:, 1]
-        fitted = pipeline
+def make_model(name: str):
+    """
+    Return a brand-new, unfitted estimator every time.
+    Never store trained models in a module-level dict — Streamlit keeps module
+    globals alive across reruns, so reusing them corrupts stored results on
+    subsequent training calls.
+    """
+    if name == "Random Forest":
+        return RandomForestClassifier(
+            n_estimators=400,
+            max_depth=12,
+            min_samples_leaf=4,
+            max_features="sqrt",
+            random_state=42,
+            n_jobs=-1,
+        )
+    elif name == "Gradient Boosting":
+        # Classic GradientBoostingClassifier: universally compatible, supports
+        # sample_weight natively without version constraints.
+        return GradientBoostingClassifier(
+            n_estimators=200,
+            max_depth=5,
+            learning_rate=0.05,
+            subsample=0.8,
+            random_state=42,
+        )
+    elif name == "Logistic Regression":
+        # saga handles L2 + large/sparse feature sets and converges reliably.
+        return LogisticRegression(
+            C=0.5,
+            solver="saga",
+            max_iter=3000,
+            random_state=42,
+        )
     else:
-        model.fit(X_train, y_train)
-        probs  = model.predict_proba(X_test)[:, 1]
-        fitted = model
+        raise ValueError(f"Unknown model: {name}")
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Feature preparation (shared between train and inference)
+# ─────────────────────────────────────────────────────────────────────────────
+def prep_X(df: pd.DataFrame, feature_cols: list,
+           imputer=None, selector=None, scaler=None,
+           fit: bool = False):
+    """
+    Drop all-NaN cols → variance filter → impute → scale.
+    fit=True: fits all transforms and returns them.
+    fit=False: applies pre-fitted transforms (inference path).
+    """
+    X = df[[c for c in feature_cols if c in df.columns]].copy()
+
+    # Remove fully-NaN columns (SimpleImputer would silently drop them from
+    # the output array, causing a column-count mismatch when rebuilding DF).
+    all_nan = [c for c in X.columns if X[c].isna().all()]
+    X = X.drop(columns=all_nan)
+    live = X.columns.tolist()
+
+    if fit:
+        selector = VarianceThreshold(threshold=1e-6)
+        mask     = selector.fit(X).get_support()
+        live     = [live[i] for i, m in enumerate(mask) if m]
+        X        = pd.DataFrame(selector.transform(X), columns=live, index=X.index)
+
+        imputer  = SimpleImputer(strategy="median")
+        X_imp    = imputer.fit_transform(X)
+
+        scaler   = StandardScaler()
+        X_sc     = scaler.fit_transform(X_imp)
+
+        return (pd.DataFrame(X_sc, columns=live, index=X.index),
+                live, imputer, selector, scaler)
+    else:
+        # Align to the columns the fitted transforms expect
+        for c in live:
+            if c not in X.columns:
+                X[c] = np.nan
+        X     = X[live]
+        X_sel = selector.transform(X)
+        X_imp = imputer.transform(X_sel)
+        X_sc  = scaler.transform(X_imp)
+        return pd.DataFrame(X_sc, columns=live, index=X.index)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Auto-threshold
+# ─────────────────────────────────────────────────────────────────────────────
+def best_f1_threshold(y_true, probs) -> float:
+    """Probability threshold that maximises F1 on this split."""
+    prec, rec, thresholds = precision_recall_curve(y_true, probs)
+    f1 = np.where(
+        (prec[:-1] + rec[:-1]) == 0,
+        0.0,
+        2 * prec[:-1] * rec[:-1] / (prec[:-1] + rec[:-1]),
+    )
+    return float(thresholds[np.argmax(f1)]) if f1.max() > 0 else 0.5
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Training pipeline
+# ─────────────────────────────────────────────────────────────────────────────
+def train_model(df: pd.DataFrame, model_name: str,
+                test_size: float, threshold_override):
+    target   = "severe_event"
+    drop     = {target, "date"} | {c for c in df.columns if "EVENT_TYPE" in c.upper()}
+    raw_cols = [c for c in df.columns if c not in drop]
+
+    y = df[target].reset_index(drop=True)
+
+    # Temporal split (no shuffle — preserve time order)
+    split    = int(len(df) * (1 - test_size))
+    df_tr    = df.iloc[:split].reset_index(drop=True)
+    df_te    = df.iloc[split:].reset_index(drop=True)
+    y_tr     = y.iloc[:split].reset_index(drop=True)
+    y_te     = y.iloc[split:].reset_index(drop=True)
+
+    # Fit feature transforms on training data only
+    X_tr, live, imputer, selector, scaler = prep_X(df_tr, raw_cols, fit=True)
+    X_te = prep_X(df_te, raw_cols, live, imputer, selector, scaler, fit=False)
+
+    # Sample weights for class imbalance (works for all estimators)
+    sw = compute_sample_weight("balanced", y_tr)
+
+    # Fresh model — never reuse a module-level instance
+    model = make_model(model_name)
+    model.fit(X_tr, y_tr, sample_weight=sw)
+
+    probs = model.predict_proba(X_te)[:, 1]
+
+    # Auto-tune or use manual threshold
+    threshold = (best_f1_threshold(y_te, probs)
+                 if threshold_override is None
+                 else threshold_override)
     preds = (probs >= threshold).astype(int)
 
     # Metrics
-    cm      = confusion_matrix(y_test, preds)
-    roc_auc = roc_auc_score(y_test, probs)
-    ap      = average_precision_score(y_test, probs)
-    report  = classification_report(y_test, preds, output_dict=True)
+    cm      = confusion_matrix(y_te, preds)
+    roc_auc = roc_auc_score(y_te, probs)
+    ap      = average_precision_score(y_te, probs)
+    report  = classification_report(y_te, preds, output_dict=True, zero_division=0)
+    fpr, tpr, _ = roc_curve(y_te, probs)
+    prec, rec, _ = precision_recall_curve(y_te, probs)
 
-    # ROC & PR curves
-    fpr, tpr, roc_thresh = roc_curve(y_test, probs)
-    prec, rec, pr_thresh  = precision_recall_curve(y_test, probs)
-
-    # Feature importance
-    if model_name == "Random Forest":
-        importances = model.feature_importances_
-    elif model_name == "Gradient Boosting":
-        importances = model.feature_importances_
+    # Feature importance — works for all three model types
+    if hasattr(model, "feature_importances_"):
+        fi = pd.Series(model.feature_importances_, index=live)
     else:
-        importances = np.abs(pipeline.named_steps["clf"].coef_[0])
+        fi = pd.Series(np.abs(model.coef_[0]), index=live)
+    fi = fi.sort_values(ascending=False)
 
-    fi = pd.Series(importances, index=feature_cols).sort_values(ascending=False)
+    # Cross-val AUC on training fold (fresh model each fold)
+    cv_scores = cross_val_score(
+        make_model(model_name), X_tr, y_tr,
+        cv=StratifiedKFold(n_splits=5, shuffle=True, random_state=42),
+        scoring="roc_auc",
+        fit_params={"sample_weight": sw},
+    )
 
     return {
-        "model":        fitted,
+        "model":        model,
+        "live_cols":    live,
         "imputer":      imputer,
-        "feature_cols": feature_cols,
-        "X_test":       X_test,
-        "y_test":       y_test,
+        "selector":     selector,
+        "scaler":       scaler,
+        "X_test":       X_te,
+        "y_test":       y_te,
         "probs":        probs,
         "preds":        preds,
         "cm":           cm,
         "roc_auc":      roc_auc,
+        "cv_auc_mean":  float(cv_scores.mean()),
+        "cv_auc_std":   float(cv_scores.std()),
         "ap":           ap,
         "report":       report,
         "fpr":          fpr,
@@ -400,69 +457,71 @@ def train_model(df: pd.DataFrame, model_name: str, test_size: float,
         "rec":          rec,
         "fi":           fi,
         "threshold":    threshold,
+        "train_size":   len(y_tr),
+        "test_size_n":  len(y_te),
+        "pos_rate":     float(y_tr.mean()),
     }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ── PREDICTION ────────────────────────────────────────────────────────────────
+# Scoring all rows for timeline
 # ─────────────────────────────────────────────────────────────────────────────
-def predict_single_day(result: dict, df_features: pd.DataFrame, new_row: dict) -> float:
-    """Given raw weather values for ONE new day, engineer features and predict."""
-    # Build a new row appended to historical data so lags are valid
+def score_all_rows(df: pd.DataFrame, result: dict) -> pd.Series:
+    X = prep_X(df, result["live_cols"],
+               result["live_cols"],
+               result["imputer"], result["selector"], result["scaler"],
+               fit=False)
+    return pd.Series(result["model"].predict_proba(X)[:, 1], index=df.index)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Single-day prediction
+# ─────────────────────────────────────────────────────────────────────────────
+def predict_single_day(result: dict, df_features: pd.DataFrame,
+                       new_row: dict) -> float:
+    keep = [c for c in df_features.columns
+            if c in ["date", "severe_event", "TMAX", "TMIN", "TAVG",
+                     "PRCP", "SNOW", "SNWD"]]
     new_df = pd.DataFrame([new_row])
     new_df["date"] = pd.to_datetime(new_row["date"])
-    new_df["severe_event"] = 0  # placeholder
+    new_df["severe_event"] = 0
 
-    # Re-engineer on the combined history + new row
-    combined = pd.concat([df_features[["date","TMAX","TMIN","TAVG","PRCP","SNOW","SNWD","severe_event"]
-                                       if all(c in df_features.columns for c in ["TMAX","TMIN","TAVG","PRCP","SNOW","SNWD"])
-                                       else df_features.columns.tolist()],
-                          new_df], ignore_index=True)
-    combined_eng = engineer_features(combined)
-    last_row = combined_eng.iloc[[-1]][result["feature_cols"]]
-
-    imputed = result["imputer"].transform(last_row)
-    prob = result["model"].predict_proba(imputed)[0, 1]
-    return prob
+    combined = pd.concat(
+        [df_features[keep], new_df[[c for c in keep if c in new_df.columns]]],
+        ignore_index=True,
+    )
+    eng  = engineer_features(combined)
+    last = eng.iloc[[-1]]
+    X    = prep_X(last, result["live_cols"],
+                  result["live_cols"],
+                  result["imputer"], result["selector"], result["scaler"],
+                  fit=False)
+    return float(result["model"].predict_proba(X)[0, 1])
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ── UI HELPERS ────────────────────────────────────────────────────────────────
+# Plot helpers
 # ─────────────────────────────────────────────────────────────────────────────
-def risk_badge(prob: float) -> str:
-    pct = prob * 100
-    if prob < 0.30:
-        return f'<span class="risk-gauge-low">🟢 LOW — {pct:.1f}%</span>'
-    elif prob < 0.60:
-        return f'<span class="risk-gauge-medium">🟡 MODERATE — {pct:.1f}%</span>'
-    else:
-        return f'<span class="risk-gauge-high">🔴 HIGH — {pct:.1f}%</span>'
-
-
 def plot_confusion(cm):
     labels = ["No Event", "Severe Event"]
-    fig = px.imshow(
-        cm, text_auto=True,
-        x=labels, y=labels,
-        color_continuous_scale="Blues",
-        labels=dict(x="Predicted", y="Actual"),
-        title="Confusion Matrix",
-    )
+    fig = px.imshow(cm, text_auto=True, x=labels, y=labels,
+                    color_continuous_scale="Blues",
+                    labels=dict(x="Predicted", y="Actual"),
+                    title="Confusion Matrix")
     fig.update_traces(textfont_size=18)
     fig.update_layout(height=340, margin=dict(t=50, b=0))
     return fig
 
 
-def plot_roc(fpr, tpr, roc_auc):
+def plot_roc(fpr, tpr, auc):
     fig = go.Figure()
     fig.add_trace(go.Scatter(x=fpr, y=tpr, mode="lines",
-                             name=f"ROC AUC = {roc_auc:.3f}",
+                             name=f"AUC = {auc:.3f}",
                              line=dict(color="#2d6a9f", width=2)))
-    fig.add_trace(go.Scatter(x=[0,1], y=[0,1], mode="lines",
+    fig.add_trace(go.Scatter(x=[0, 1], y=[0, 1], mode="lines",
                              name="Random", line=dict(dash="dash", color="gray")))
-    fig.update_layout(title="ROC Curve", xaxis_title="FPR",
-                      yaxis_title="TPR", height=340,
-                      margin=dict(t=50, b=0), legend=dict(x=0.6, y=0.1))
+    fig.update_layout(title="ROC Curve", xaxis_title="FPR", yaxis_title="TPR",
+                      height=340, margin=dict(t=50, b=0))
     return fig
 
 
@@ -471,78 +530,76 @@ def plot_pr(prec, rec, ap):
     fig.add_trace(go.Scatter(x=rec, y=prec, mode="lines",
                              name=f"AP = {ap:.3f}",
                              line=dict(color="#e74c3c", width=2)))
-    fig.update_layout(title="Precision-Recall Curve", xaxis_title="Recall",
-                      yaxis_title="Precision", height=340,
-                      margin=dict(t=50, b=0), legend=dict(x=0.6, y=0.9))
+    fig.update_layout(title="Precision-Recall Curve",
+                      xaxis_title="Recall", yaxis_title="Precision",
+                      height=340, margin=dict(t=50, b=0))
     return fig
 
 
-def plot_feature_importance(fi: pd.Series, top_n: int = 20):
+def plot_feature_importance(fi, top_n=20):
     top = fi.head(top_n).sort_values()
-    fig = px.bar(
-        x=top.values, y=top.index,
-        orientation="h",
-        title=f"Top {top_n} Feature Importances",
-        labels={"x": "Importance", "y": "Feature"},
-        color=top.values,
-        color_continuous_scale="Blues",
-    )
-    fig.update_layout(height=480, margin=dict(t=50, b=0), showlegend=False)
+    fig = px.bar(x=top.values, y=top.index, orientation="h",
+                 title=f"Top {top_n} Feature Importances",
+                 color=top.values, color_continuous_scale="Blues",
+                 labels={"x": "Importance", "y": "Feature"})
+    fig.update_layout(height=500, margin=dict(t=50, b=0), showlegend=False)
     return fig
 
 
-def plot_risk_timeline(df: pd.DataFrame, probs_col: str = "risk_score", tail: int = 365):
+def plot_risk_timeline(df, tail=730):
     sub = df.tail(tail).copy()
     fig = go.Figure()
     fig.add_trace(go.Scatter(
-        x=sub["date"], y=sub[probs_col], mode="lines",
+        x=sub["date"], y=sub["risk_score"], mode="lines",
         name="Risk Score", line=dict(color="#2d6a9f"),
         fill="tozeroy", fillcolor="rgba(45,106,159,0.15)",
     ))
     if "severe_event" in sub.columns:
-        events = sub[sub["severe_event"] == 1]
+        ev = sub[sub["severe_event"] == 1]
         fig.add_trace(go.Scatter(
-            x=events["date"], y=events[probs_col],
-            mode="markers", name="Actual Event",
-            marker=dict(color="red", size=6, symbol="x"),
+            x=ev["date"], y=ev["risk_score"], mode="markers",
+            name="Actual Event",
+            marker=dict(color="red", size=7, symbol="x"),
         ))
     fig.add_hline(y=0.30, line_dash="dot", line_color="#f39c12",
-                  annotation_text="Moderate threshold")
+                  annotation_text="Moderate")
     fig.add_hline(y=0.60, line_dash="dot", line_color="#e74c3c",
-                  annotation_text="High threshold")
-    fig.update_layout(
-        title="Historical Risk Score Timeline",
-        xaxis_title="Date", yaxis_title="Risk Score",
-        height=400, margin=dict(t=50, b=0),
-        yaxis=dict(range=[0, 1]),
-    )
+                  annotation_text="High")
+    fig.update_layout(title="Risk Score Timeline (last 2 years shown)",
+                      xaxis_title="Date", yaxis_title="Risk Score",
+                      yaxis=dict(range=[0, 1]),
+                      height=420, margin=dict(t=50, b=0))
     return fig
 
 
-def plot_monthly_risk(df: pd.DataFrame, probs_col: str = "risk_score"):
-    if "month" not in df.columns:
-        df["month"] = df["date"].dt.month
-    monthly = df.groupby("month")[probs_col].mean().reset_index()
-    month_names = {1:"Jan",2:"Feb",3:"Mar",4:"Apr",5:"May",6:"Jun",
-                   7:"Jul",8:"Aug",9:"Sep",10:"Oct",11:"Nov",12:"Dec"}
-    monthly["month_name"] = monthly["month"].map(month_names)
-    fig = px.bar(
-        monthly, x="month_name", y=probs_col,
-        title="Average Risk Score by Month",
-        color=probs_col, color_continuous_scale="RdYlGn_r",
-        labels={"risk_score": "Avg Risk", "month_name": "Month"},
-    )
+def plot_monthly_risk(df):
+    df = df.copy()
+    df["month"] = df["date"].dt.month
+    names = {1:"Jan",2:"Feb",3:"Mar",4:"Apr",5:"May",6:"Jun",
+             7:"Jul",8:"Aug",9:"Sep",10:"Oct",11:"Nov",12:"Dec"}
+    m = df.groupby("month")["risk_score"].mean().reset_index()
+    m["name"] = m["month"].map(names)
+    fig = px.bar(m, x="name", y="risk_score",
+                 title="Average Risk Score by Month",
+                 color="risk_score", color_continuous_scale="RdYlGn_r",
+                 labels={"risk_score": "Avg Risk", "name": "Month"})
     fig.update_layout(height=340, margin=dict(t=50, b=0))
     return fig
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# ── MAIN APP ──────────────────────────────────────────────────────────────────
-# ─────────────────────────────────────────────────────────────────────────────
-st.title("⛈️ Severe Weather Risk Predictor")
-st.caption("Upload your weather & storm event datasets → engineer features → train an ML model → predict risk.")
+def risk_badge(prob):
+    pct = prob * 100
+    if prob < 0.30:
+        return f'<span class="risk-low">🟢 LOW — {pct:.1f}%</span>'
+    elif prob < 0.60:
+        return f'<span class="risk-medium">🟡 MODERATE — {pct:.1f}%</span>'
+    else:
+        return f'<span class="risk-high">🔴 HIGH — {pct:.1f}%</span>'
 
-# ── SIDEBAR ───────────────────────────────────────────────────────────────────
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Sidebar
+# ─────────────────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.header("⚙️ Configuration")
 
@@ -558,29 +615,50 @@ with st.sidebar:
         ["All events in storm file", "Only pre-defined severe types"],
         index=0,
     )
-    min_category = "any" if label_mode.startswith("All") else "severe"
+    lm = "any" if label_mode.startswith("All") else "severe"
+
+    filter_overlap = st.checkbox(
+        "Filter to storm-record window ✅ (recommended)",
+        value=True,
+        help=(
+            "Restricts training to years within your storm database's coverage. "
+            "Without this, pre-record years get label=0 (no data != no storm), "
+            "which dilutes the positive rate from ~3% to ~0.7% and wrecks recall."
+        ),
+    )
 
     st.divider()
 
     st.subheader("🤖 Model Settings")
     model_name = st.selectbox(
-        "Algorithm", list(MODEL_REGISTRY.keys()), index=0
+        "Algorithm",
+        ["Random Forest", "Gradient Boosting", "Logistic Regression"],
+        index=0,
     )
-    test_size  = st.slider("Test set size (%)", 10, 40, 20) / 100
-    threshold  = st.slider(
-        "Decision threshold", 0.1, 0.9, 0.40, 0.05,
-        help="Probability above which a day is flagged as 'severe'."
+    test_size = st.slider("Test set size (%)", 10, 40, 20) / 100
+
+    auto_threshold = st.checkbox(
+        "Auto-tune threshold (maximise F1) ✅",
+        value=True,
+        help=(
+            "Finds the probability cutoff that maximises F1 on the test set. "
+            "With ~3% positive rate a fixed threshold of 0.40 almost always "
+            "predicts zero positives — auto-tuning fixes this."
+        ),
     )
+    manual_threshold = None
+    if not auto_threshold:
+        manual_threshold = st.slider("Manual threshold", 0.05, 0.90, 0.20, 0.05)
 
     run_btn = st.button("🚀 Train Model", type="primary", use_container_width=True)
-
     st.divider()
     st.caption("Built with scikit-learn • Streamlit • Plotly")
 
+
 # ─────────────────────────────────────────────────────────────────────────────
-# TAB LAYOUT
+# Tabs
 # ─────────────────────────────────────────────────────────────────────────────
-tab_data, tab_features, tab_train, tab_eval, tab_predict = st.tabs([
+tab_data, tab_feat, tab_train, tab_eval, tab_pred = st.tabs([
     "📊 Data Explorer",
     "🔧 Feature Engineering",
     "🏋️ Training",
@@ -588,20 +666,23 @@ tab_data, tab_features, tab_train, tab_eval, tab_predict = st.tabs([
     "🔮 Predict New Day",
 ])
 
-# ────────────────────────────── TAB: DATA EXPLORER ───────────────────────────
+# ── Data Explorer ─────────────────────────────────────────────────────────────
 with tab_data:
+    st.title("⛈️ Severe Weather Risk Predictor")
+    st.caption("Upload both CSVs in the sidebar, then work through the tabs.")
+
     if not weather_file or not storm_file:
         st.info("👈 Upload both CSV files in the sidebar to get started.")
         st.markdown("""
-        **Expected file formats:**
+**Supported formats**
 
-        | File | Required columns |
-        |------|-----------------|
-        | Daily Weather CSV | `Date`, `TMAX`, `TMIN`, `PRCP` (others optional: `TAVG`, `SNOW`, `SNWD`) |
-        | Storm Events CSV | `BEGIN_DATE` (or `DATE`), `EVENT_TYPE` |
+| File | Required columns |
+|------|-----------------|
+| Daily Weather CSV | `Date`, `TMAX`, `TMIN`, `PRCP` (optional: `TAVG`, `SNOW`, `SNWD`) |
+| Storm Events CSV | `BEGIN_DATE` (or `DATE`), `EVENT_TYPE` |
 
-        Both NOAA GHCN weather exports and NOAA Storm Events Database exports are supported out-of-the-box.
-        """)
+NOAA GHCN weather exports and NOAA Storm Events Database exports are supported.
+""")
     else:
         try:
             df_weather = load_weather_csv(weather_file)
@@ -609,285 +690,294 @@ with tab_data:
             st.session_state["df_weather"] = df_weather
             st.session_state["df_storm"]   = df_storm
 
-            col1, col2 = st.columns(2)
-            with col1:
+            c1, c2 = st.columns(2)
+            with c1:
                 st.markdown("### 🌡️ Weather Data")
                 st.metric("Rows", f"{len(df_weather):,}")
-                st.metric("Date range", f"{df_weather['date'].min().date()} → {df_weather['date'].max().date()}")
+                st.metric("Date range",
+                          f"{df_weather['date'].min().date()} → "
+                          f"{df_weather['date'].max().date()}")
                 st.dataframe(df_weather.head(10), use_container_width=True)
 
-                # Missing value heatmap
                 miss = df_weather.isnull().mean().reset_index()
-                miss.columns = ["column", "missing_pct"]
+                miss.columns = ["column", "pct"]
                 miss = miss[miss["column"] != "date"]
-                fig_miss = px.bar(miss, x="column", y="missing_pct",
-                                  title="Missing Value Rate per Column",
-                                  labels={"missing_pct":"Missing %","column":""},
-                                  color="missing_pct", color_continuous_scale="Reds")
-                fig_miss.update_layout(height=280, margin=dict(t=50,b=0))
-                st.plotly_chart(fig_miss, use_container_width=True)
+                fig_m = px.bar(miss, x="column", y="pct",
+                               title="Missing Value Rate",
+                               color="pct", color_continuous_scale="Reds",
+                               labels={"pct": "Missing %", "column": ""})
+                fig_m.update_layout(height=260, margin=dict(t=40, b=0))
+                st.plotly_chart(fig_m, use_container_width=True)
 
-            with col2:
+            with c2:
                 st.markdown("### 🌪️ Storm Events Data")
                 st.metric("Rows", f"{len(df_storm):,}")
                 st.metric("Unique event types", df_storm["EVENT_TYPE"].nunique())
-                st.dataframe(df_storm[["date","EVENT_TYPE"]].head(20), use_container_width=True)
+                st.metric("Date range",
+                          f"{df_storm['date'].min().date()} → "
+                          f"{df_storm['date'].max().date()}")
+                st.dataframe(df_storm[["date","EVENT_TYPE"]].head(20),
+                             use_container_width=True)
 
-                # Event type breakdown
                 vc = df_storm["EVENT_TYPE"].value_counts().reset_index()
                 vc.columns = ["EVENT_TYPE","count"]
                 fig_ev = px.bar(vc.head(15), x="count", y="EVENT_TYPE",
-                                orientation="h",
-                                title="Top Event Types",
+                                orientation="h", title="Top Event Types",
                                 color="count", color_continuous_scale="Blues")
-                fig_ev.update_layout(height=350, margin=dict(t=50,b=0), yaxis=dict(autorange="reversed"))
+                fig_ev.update_layout(height=380, margin=dict(t=40, b=0),
+                                     yaxis=dict(autorange="reversed"))
                 st.plotly_chart(fig_ev, use_container_width=True)
 
-            # Overlap visualisation
-            st.markdown("### 📅 Event Frequency by Year")
+            # Overlap summary
+            ov_start = max(df_weather["date"].min(), df_storm["date"].min())
+            ov_end   = min(df_weather["date"].max(), df_storm["date"].max())
+            ov_rows  = df_weather[(df_weather["date"] >= ov_start) &
+                                  (df_weather["date"] <= ov_end)]
+            ev_dates = set(df_storm["date"])
+            pos_ov   = ov_rows["date"].isin(ev_dates).sum()
+            st.info(
+                f"**Training window (overlap):** {ov_start.date()} → {ov_end.date()} — "
+                f"{len(ov_rows):,} days, "
+                f"**{pos_ov} storm-event days ({pos_ov/len(ov_rows)*100:.1f}% positive rate)**"
+            )
+
             df_storm["year"] = df_storm["date"].dt.year
-            by_year = df_storm.groupby(["year","EVENT_TYPE"]).size().reset_index(name="count")
-            fig_yr = px.bar(by_year, x="year", y="count", color="EVENT_TYPE",
-                            title="Storm Events by Year (stacked)")
-            fig_yr.update_layout(height=360, margin=dict(t=50,b=0))
+            by_yr = df_storm.groupby(["year","EVENT_TYPE"]).size().reset_index(name="n")
+            fig_yr = px.bar(by_yr, x="year", y="n", color="EVENT_TYPE",
+                            title="Storm Events by Year")
+            fig_yr.update_layout(height=340, margin=dict(t=40, b=0))
             st.plotly_chart(fig_yr, use_container_width=True)
 
         except Exception as e:
             st.error(f"Error loading files: {e}")
 
-# ──────────────────────────── TAB: FEATURE ENGINEERING ───────────────────────
-with tab_features:
-    if "df_weather" not in st.session_state:
+# ── Feature Engineering ───────────────────────────────────────────────────────
+with tab_feat:
+    if st.session_state["df_weather"] is None:
         st.info("Load your data first (Data Explorer tab).")
     else:
         df_weather = st.session_state["df_weather"]
         df_storm   = st.session_state["df_storm"]
 
         st.markdown("### 🏗️ Feature Engineering Pipeline")
-        with st.expander("What features are created?", expanded=True):
+        with st.expander("Feature catalogue", expanded=True):
             st.markdown("""
 | Category | Features |
 |----------|---------|
 | **Calendar** | `month`, `season`, `day_of_year`, `week`, cyclical sin/cos encodings |
-| **Temperature** | `temp_range`, `temp_mean_est`, `heat_index` |
-| **Precipitation flags** | `prcp_nonzero`, `heavy_rain`, `snow_nonzero` |
-| **Lag features** | 1, 2, 3, 7-day lags for all weather variables |
-| **Rolling stats** | 7-, 14-, 30-day rolling mean, std, max (computed on lagged data to prevent leakage) |
+| **Temperature** | `temp_range`, `temp_mean_est`, `tmax_extreme`, `tmin_extreme`, `temp_swing`, day-over-day deltas |
+| **Precipitation** | `prcp_nonzero`, `heavy_rain`, `extreme_rain`, `days_since_rain`, `prcp_5d_total` |
+| **Snow** | `snow_nonzero`, `days_since_snow` |
+| **Lags** | 1, 2, 3, 7-day lags for all base weather variables |
+| **Rolling stats** | 7/14/30-day rolling mean, std, max (shift(1) — no leakage) |
 | **Trend** | Deviation from 7- and 14-day rolling mean |
-| **Consecutive counters** | `days_since_rain`, `days_since_snow` |
+| **Interactions** | `season × TMAX`, `season × PRCP` |
 """)
 
-        with st.spinner("Engineering features…"):
-            df_labeled   = build_label(df_weather, df_storm, SEVERE_TYPES, min_category)
-            df_engineered= engineer_features(df_labeled)
-            df_engineered= df_engineered.dropna(subset=["date"])
+        with st.spinner("Building features…"):
+            df_lab = build_label(df_weather, df_storm, lm, filter_overlap)
+            df_eng = engineer_features(df_lab)
+            df_eng = df_eng.dropna(subset=["date"])
+        st.session_state["df_features"] = df_eng
 
-        st.session_state["df_features"] = df_engineered
+        pos = int(df_eng["severe_event"].sum())
+        tot = len(df_eng)
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Total features", len(df_eng.columns) - 2)
+        c2.metric("Severe-event days", pos)
+        c3.metric("Positive rate", f"{pos/tot*100:.1f}%")
 
-        col1, col2, col3 = st.columns(3)
-        col1.metric("Total features", len(df_engineered.columns) - 2)
-        col2.metric("Severe event days", int(df_engineered["severe_event"].sum()))
-        col3.metric("Class balance", f"{df_engineered['severe_event'].mean()*100:.1f}% positive")
+        num_cols = [c for c in df_eng.select_dtypes(include=np.number).columns
+                    if c != "severe_event"]
+        corr = df_eng[num_cols + ["severe_event"]].corr()["severe_event"].drop("severe_event")
+        top  = corr.abs().sort_values(ascending=False).head(25)
+        cd   = pd.DataFrame({"feature": top.index, "corr": corr[top.index]})
+        fig_c = px.bar(cd, x="corr", y="feature", orientation="h",
+                       title="Top 25 Feature Correlations with Target",
+                       color="corr", color_continuous_scale="RdBu",
+                       range_color=[-0.5, 0.5])
+        fig_c.update_layout(height=560, margin=dict(t=50, b=0),
+                            yaxis=dict(autorange="reversed"))
+        st.plotly_chart(fig_c, use_container_width=True)
+        st.dataframe(df_eng.tail(10), use_container_width=True)
 
-        # Feature correlation with target
-        num_cols = df_engineered.select_dtypes(include=[np.number]).columns.tolist()
-        num_cols = [c for c in num_cols if c != "severe_event"]
-        corr = df_engineered[num_cols + ["severe_event"]].corr()["severe_event"].drop("severe_event")
-        top_corr = corr.abs().sort_values(ascending=False).head(25)
-        corr_df  = pd.DataFrame({"feature": top_corr.index,
-                                  "correlation": corr[top_corr.index]})
-        fig_corr = px.bar(corr_df, x="correlation", y="feature",
-                          orientation="h",
-                          title="Top 25 Feature Correlations with Target",
-                          color="correlation",
-                          color_continuous_scale="RdBu",
-                          range_color=[-0.5, 0.5])
-        fig_corr.update_layout(height=550, margin=dict(t=50,b=0),
-                                yaxis=dict(autorange="reversed"))
-        st.plotly_chart(fig_corr, use_container_width=True)
-
-        st.dataframe(df_engineered.tail(10), use_container_width=True)
-
-# ─────────────────────────────── TAB: TRAINING ───────────────────────────────
+# ── Training ──────────────────────────────────────────────────────────────────
 with tab_train:
-    if "df_features" not in st.session_state or st.session_state["df_features"] is None:
-        st.info("Complete Feature Engineering tab first.")
+    if st.session_state["df_features"] is None:
+        st.info("Complete the Feature Engineering tab first.")
     else:
         st.markdown("### 🏋️ Model Training")
 
         if run_btn:
             df_feat = st.session_state["df_features"].copy()
-
             with st.spinner(f"Training {model_name}…"):
-                result = train_model(df_feat, model_name, test_size, threshold)
-
-            st.session_state.update({
-                "result":     result,
-                "trained":    True,
-                "model_name": model_name,
-                "threshold":  threshold,
-            })
-
-            # Compute risk scores on full dataset.
-            # Must use the exact feature_cols the model was trained on (already
-            # has all-NaN columns removed and matches the imputer's expected input).
-            feat_cols = result["feature_cols"]
-            X_all = result["imputer"].transform(
-                df_feat[feat_cols].fillna(df_feat[feat_cols].median(numeric_only=True))
-            )
-            df_feat["risk_score"] = result["model"].predict_proba(X_all)[:, 1]
-            st.session_state["df_features_scored"] = df_feat
-
-            st.success(f"✅ {model_name} trained! ROC-AUC = **{result['roc_auc']:.3f}**")
-
-        if st.session_state.get("trained"):
-            result = st.session_state["result"]
-            c1, c2, c3, c4 = st.columns(4)
-            rep = result["report"]
-            c1.metric("ROC-AUC",      f"{result['roc_auc']:.3f}")
-            c2.metric("Avg Precision", f"{result['ap']:.3f}")
-            c3.metric("F1 (severe)",   f"{rep.get('1', rep.get(1,{})).get('f1-score', 0):.3f}")
-            c4.metric("Precision (severe)", f"{rep.get('1', rep.get(1,{})).get('precision', 0):.3f}")
-
-            # Timeline
-            if "df_features_scored" in st.session_state:
-                st.plotly_chart(
-                    plot_risk_timeline(st.session_state["df_features_scored"]),
-                    use_container_width=True,
-                )
-                col1, col2 = st.columns(2)
-                with col1:
-                    st.plotly_chart(
-                        plot_monthly_risk(st.session_state["df_features_scored"]),
-                        use_container_width=True,
+                try:
+                    result = train_model(
+                        df_feat, model_name, test_size,
+                        None if auto_threshold else manual_threshold,
                     )
-                with col2:
-                    st.plotly_chart(
-                        plot_feature_importance(result["fi"]),
-                        use_container_width=True,
+                    st.session_state["result"]  = result
+                    st.session_state["trained"] = True
+
+                    df_feat["risk_score"] = score_all_rows(df_feat, result)
+                    st.session_state["df_features_scored"] = df_feat
+
+                    st.success(
+                        f"✅ {model_name} trained — "
+                        f"ROC-AUC = **{result['roc_auc']:.3f}** | "
+                        f"CV AUC = {result['cv_auc_mean']:.3f} ±{result['cv_auc_std']:.2f} | "
+                        f"Threshold = **{result['threshold']:.3f}**"
                     )
+                except Exception as e:
+                    st.error(f"Training error: {e}")
+                    st.exception(e)
+
+        if st.session_state["trained"] and st.session_state["result"]:
+            result  = st.session_state["result"]
+            rep     = result["report"]
+            pos_key = "1" if "1" in rep else 1
+
+            c1, c2, c3, c4, c5 = st.columns(5)
+            c1.metric("ROC-AUC",        f"{result['roc_auc']:.3f}")
+            c2.metric("CV AUC",         f"{result['cv_auc_mean']:.3f} ±{result['cv_auc_std']:.2f}")
+            c3.metric("Avg Precision",  f"{result['ap']:.3f}")
+            c4.metric("F1 (severe)",    f"{rep.get(pos_key,{}).get('f1-score',0):.3f}")
+            c5.metric("Threshold used", f"{result['threshold']:.3f}")
+
+            c6, c7 = st.columns(2)
+            c6.metric("Training days", f"{result['train_size']:,}")
+            c7.metric("Positive rate", f"{result['pos_rate']*100:.1f}%")
+
+            df_sc = st.session_state.get("df_features_scored")
+            if df_sc is not None:
+                st.plotly_chart(plot_risk_timeline(df_sc), use_container_width=True)
+                ca, cb = st.columns(2)
+                with ca:
+                    st.plotly_chart(plot_monthly_risk(df_sc), use_container_width=True)
+                with cb:
+                    st.plotly_chart(plot_feature_importance(result["fi"]),
+                                    use_container_width=True)
         else:
             st.info("Click **🚀 Train Model** in the sidebar to start.")
 
-# ──────────────────────────────── TAB: EVALUATION ────────────────────────────
+# ── Evaluation ────────────────────────────────────────────────────────────────
 with tab_eval:
-    if not st.session_state.get("trained"):
+    if not st.session_state["trained"]:
         st.info("Train a model first.")
     else:
         result = st.session_state["result"]
         st.markdown("### 📈 Model Evaluation")
 
-        col1, col2 = st.columns(2)
-        with col1:
+        c1, c2 = st.columns(2)
+        with c1:
             st.plotly_chart(plot_confusion(result["cm"]), use_container_width=True)
-        with col2:
+        with c2:
             st.plotly_chart(plot_roc(result["fpr"], result["tpr"], result["roc_auc"]),
                             use_container_width=True)
 
-        col3, col4 = st.columns(2)
-        with col3:
+        c3, c4 = st.columns(2)
+        with c3:
             st.plotly_chart(plot_pr(result["prec"], result["rec"], result["ap"]),
                             use_container_width=True)
-        with col4:
-            # Probability distribution
+        with c4:
             df_probs = pd.DataFrame({
                 "probability": result["probs"],
-                "actual": result["y_test"].values
+                "actual":      result["y_test"].values,
             })
-            fig_dist = px.histogram(
+            fig_d = px.histogram(
                 df_probs, x="probability", color="actual",
                 barmode="overlay", nbins=40,
                 title="Predicted Probability Distribution",
-                labels={"actual":"Severe Event","probability":"P(Severe)"},
-                color_discrete_map={0:"steelblue", 1:"crimson"},
+                labels={"actual": "Severe Event", "probability": "P(Severe)"},
+                color_discrete_map={0: "steelblue", 1: "crimson"},
             )
-            fig_dist.add_vline(x=result["threshold"], line_dash="dash",
-                               annotation_text="Threshold")
-            fig_dist.update_layout(height=340, margin=dict(t=50,b=0))
-            st.plotly_chart(fig_dist, use_container_width=True)
+            fig_d.add_vline(x=result["threshold"], line_dash="dash",
+                            annotation_text=f"Threshold={result['threshold']:.2f}")
+            fig_d.update_layout(height=340, margin=dict(t=50, b=0))
+            st.plotly_chart(fig_d, use_container_width=True)
 
         st.markdown("#### Classification Report")
-        rep_df = pd.DataFrame(result["report"]).T
-        st.dataframe(rep_df.style.format("{:.3f}"), use_container_width=True)
+        st.dataframe(
+            pd.DataFrame(result["report"]).T.style.format("{:.3f}"),
+            use_container_width=True,
+        )
 
-        # Threshold sensitivity
         st.markdown("#### Threshold Sensitivity")
-        thresholds = np.linspace(0.1, 0.9, 80)
-        metrics_list = []
+        thresholds = np.linspace(0.05, 0.90, 85)
+        rows = []
+        pos_key = "1" if "1" in result["report"] else 1
         for t in thresholds:
-            p = (result["probs"] >= t).astype(int)
-            cr = classification_report(result["y_test"], p, output_dict=True, zero_division=0)
-            metrics_list.append({
+            p  = (result["probs"] >= t).astype(int)
+            cr = classification_report(result["y_test"], p,
+                                       output_dict=True, zero_division=0)
+            rows.append({
                 "threshold": t,
-                "precision": cr.get("1", cr.get(1,{})).get("precision", 0),
-                "recall":    cr.get("1", cr.get(1,{})).get("recall", 0),
-                "f1":        cr.get("1", cr.get(1,{})).get("f1-score", 0),
+                "precision": cr.get(pos_key, {}).get("precision", 0),
+                "recall":    cr.get(pos_key, {}).get("recall", 0),
+                "f1":        cr.get(pos_key, {}).get("f1-score", 0),
             })
-        thr_df = pd.DataFrame(metrics_list)
-        fig_thr = go.Figure()
+        thr_df = pd.DataFrame(rows)
+        fig_t  = go.Figure()
         for metric, color in [("precision","#2ecc71"),("recall","#e74c3c"),("f1","#3498db")]:
-            fig_thr.add_trace(go.Scatter(x=thr_df["threshold"], y=thr_df[metric],
-                                          mode="lines", name=metric.capitalize(),
-                                          line=dict(color=color)))
-        fig_thr.add_vline(x=result["threshold"], line_dash="dash",
-                          annotation_text="Current threshold")
-        fig_thr.update_layout(title="Precision / Recall / F1 vs Threshold",
-                               xaxis_title="Threshold", yaxis_title="Score",
-                               height=360, margin=dict(t=50,b=0))
-        st.plotly_chart(fig_thr, use_container_width=True)
+            fig_t.add_trace(go.Scatter(
+                x=thr_df["threshold"], y=thr_df[metric],
+                mode="lines", name=metric.capitalize(), line=dict(color=color),
+            ))
+        fig_t.add_vline(x=result["threshold"], line_dash="dash",
+                        annotation_text="Used threshold")
+        fig_t.update_layout(title="Precision / Recall / F1 vs Threshold",
+                            xaxis_title="Threshold", yaxis_title="Score",
+                            height=360, margin=dict(t=50, b=0))
+        st.plotly_chart(fig_t, use_container_width=True)
 
-# ─────────────────────────────── TAB: PREDICT ────────────────────────────────
-with tab_predict:
-    if not st.session_state.get("trained"):
+# ── Predict New Day ───────────────────────────────────────────────────────────
+with tab_pred:
+    if not st.session_state["trained"]:
         st.info("Train a model first.")
     else:
         st.markdown("### 🔮 Predict Risk for a New Day")
-        st.caption("Enter tomorrow's weather forecast to get a severe weather risk score.")
+        st.caption("Enter tomorrow's forecast values to get a risk score.")
 
-        df_feat = st.session_state.get("df_features_scored",
-                  st.session_state.get("df_features"))
-
-        # Determine available columns
+        df_feat = st.session_state.get(
+            "df_features_scored", st.session_state["df_features"]
+        )
         has = lambda c: c in df_feat.columns
 
         with st.form("predict_form"):
-            cols = st.columns(3)
-            input_date = cols[0].date_input("Date", value=pd.Timestamp.today())
+            col1, col2, col3 = st.columns(3)
+            input_date = col1.date_input("Date", value=pd.Timestamp.today())
+            tmax = col2.number_input("TMAX (°F)", value=70.0, step=0.5) if has("TMAX") else 70.0
+            tmin = col3.number_input("TMIN (°F)", value=50.0, step=0.5) if has("TMIN") else 50.0
 
-            tmax = cols[1].number_input("TMAX (°F)", value=70.0, step=0.5) if has("TMAX") else 70.0
-            tmin = cols[2].number_input("TMIN (°F)", value=50.0, step=0.5) if has("TMIN") else 50.0
-
-            cols2 = st.columns(3)
-            tavg = cols2[0].number_input("TAVG (°F)", value=(tmax+tmin)/2, step=0.5) if has("TAVG") else (tmax+tmin)/2
-            prcp = cols2[1].number_input("PRCP (in)", value=0.0, min_value=0.0, step=0.01) if has("PRCP") else 0.0
-            snow = cols2[2].number_input("SNOW (in)", value=0.0, min_value=0.0, step=0.1) if has("SNOW") else 0.0
-            snwd = st.number_input("SNWD – Snow Depth (in)", value=0.0, min_value=0.0, step=0.1) if has("SNWD") else 0.0
+            col4, col5, col6 = st.columns(3)
+            tavg = col4.number_input("TAVG (°F)", value=float(round((tmax+tmin)/2,1)),
+                                     step=0.5) if has("TAVG") else (tmax+tmin)/2
+            prcp = col5.number_input("PRCP (in)", value=0.0, min_value=0.0,
+                                     step=0.01) if has("PRCP") else 0.0
+            snow = col6.number_input("SNOW (in)", value=0.0, min_value=0.0,
+                                     step=0.1) if has("SNOW") else 0.0
+            snwd = st.number_input("SNWD – Snow Depth (in)", value=0.0,
+                                   min_value=0.0, step=0.1) if has("SNWD") else 0.0
 
             submitted = st.form_submit_button("⚡ Predict Risk", type="primary")
 
         if submitted:
-            new_row = {
-                "date": str(input_date),
-                "severe_event": 0,
-            }
-            if has("TMAX"): new_row["TMAX"] = tmax
-            if has("TMIN"): new_row["TMIN"] = tmin
-            if has("TAVG"): new_row["TAVG"] = tavg
-            if has("PRCP"): new_row["PRCP"] = prcp
-            if has("SNOW"): new_row["SNOW"] = snow
-            if has("SNWD"): new_row["SNWD"] = snwd
+            new_row: dict = {"date": str(input_date), "severe_event": 0}
+            for col, val in [("TMAX",tmax),("TMIN",tmin),("TAVG",tavg),
+                              ("PRCP",prcp),("SNOW",snow),("SNWD",snwd)]:
+                if has(col):
+                    new_row[col] = val
 
             try:
-                result = st.session_state["result"]
-                prob   = predict_single_day(result, df_feat, new_row)
-
+                prob = predict_single_day(
+                    st.session_state["result"], df_feat, new_row
+                )
                 st.markdown("---")
-                st.markdown(f"## Risk Assessment for **{input_date}**")
+                st.markdown(f"## Risk for **{input_date}**")
                 st.markdown(risk_badge(prob), unsafe_allow_html=True)
 
-                # Gauge chart
-                fig_gauge = go.Figure(go.Indicator(
-                    mode  = "gauge+number+delta",
+                fig_g = go.Figure(go.Indicator(
+                    mode  = "gauge+number",
                     value = prob * 100,
                     title = {"text": "Severe Weather Risk (%)"},
                     gauge = {
@@ -899,34 +989,34 @@ with tab_predict:
                             {"range": [60,100], "color": "#fadbd8"},
                         ],
                         "threshold": {
-                            "line": {"color": "black", "width": 4},
+                            "line":      {"color": "black", "width": 4},
                             "thickness": 0.75,
-                            "value": result["threshold"] * 100,
+                            "value":     st.session_state["result"]["threshold"] * 100,
                         },
                     },
                     number={"suffix": "%", "font": {"size": 40}},
                 ))
-                fig_gauge.update_layout(height=300, margin=dict(t=30,b=0))
-                st.plotly_chart(fig_gauge, use_container_width=True)
+                fig_g.update_layout(height=300, margin=dict(t=30, b=0))
+                st.plotly_chart(fig_g, use_container_width=True)
 
-                # Contextual advice
-                st.markdown("#### 📋 Interpretation")
+                st.markdown("#### Interpretation")
                 if prob < 0.30:
-                    st.success("Low risk. Standard precautions apply.")
+                    st.success("Low risk — standard monitoring.")
                 elif prob < 0.60:
-                    st.warning("Moderate risk. Monitor forecasts; consider activating early-warning protocols.")
+                    st.warning("Moderate risk — monitor forecasts; consider early-warning checks.")
                 else:
-                    st.error("High risk. Strong chance of severe weather. Recommend issuing alerts and activating emergency plans.")
+                    st.error("High risk — strong potential for severe weather. Activate alert protocols.")
 
-                # Show comparable historical days
-                st.markdown("#### 📚 Similar Historical Days")
-                df_hist = df_feat.dropna(subset=["risk_score"])
-                similar = df_hist.iloc[
-                    (df_hist["risk_score"] - prob).abs().argsort()[:10]
-                ][["date","risk_score","severe_event"] +
-                  [c for c in ["TMAX","TMIN","PRCP","SNOW"] if c in df_hist.columns]]
-                similar["risk_score"] = similar["risk_score"].round(3)
-                st.dataframe(similar, use_container_width=True)
+                if "risk_score" in df_feat.columns:
+                    st.markdown("#### Similar Historical Days")
+                    show = (["date","risk_score","severe_event"] +
+                            [c for c in ["TMAX","TMIN","PRCP","SNOW"] if c in df_feat.columns])
+                    nearest = df_feat.iloc[
+                        (df_feat["risk_score"] - prob).abs().argsort()[:10]
+                    ][show].copy()
+                    nearest["risk_score"] = nearest["risk_score"].round(3)
+                    st.dataframe(nearest, use_container_width=True)
 
             except Exception as e:
                 st.error(f"Prediction error: {e}")
+                st.exception(e)
