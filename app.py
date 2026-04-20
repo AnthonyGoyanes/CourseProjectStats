@@ -320,22 +320,25 @@ def make_model(name: str):
 # Feature preparation (shared between train and inference)
 # ─────────────────────────────────────────────────────────────────────────────
 def prep_X(df: pd.DataFrame, feature_cols: list,
+           live_cols: list = None,
            imputer=None, selector=None, scaler=None,
            fit: bool = False):
     """
     Drop all-NaN cols → variance filter → impute → scale.
-    fit=True: fits all transforms and returns them.
-    fit=False: applies pre-fitted transforms (inference path).
+
+    fit=True  (training path): fits all transforms from feature_cols, returns
+              (X_scaled_df, live_cols, imputer, selector, scaler).
+    fit=False (inference path): live_cols/imputer/selector/scaler must be
+              supplied; aligns columns and applies the fitted transforms.
     """
-    X = df[[c for c in feature_cols if c in df.columns]].copy()
-
-    # Remove fully-NaN columns (SimpleImputer would silently drop them from
-    # the output array, causing a column-count mismatch when rebuilding DF).
-    all_nan = [c for c in X.columns if X[c].isna().all()]
-    X = X.drop(columns=all_nan)
-    live = X.columns.tolist()
-
     if fit:
+        X = df[[c for c in feature_cols if c in df.columns]].copy()
+
+        # Drop columns that are entirely NaN
+        all_nan = [c for c in X.columns if X[c].isna().all()]
+        X = X.drop(columns=all_nan)
+        live = X.columns.tolist()
+
         selector = VarianceThreshold(threshold=1e-6)
         mask     = selector.fit(X).get_support()
         live     = [live[i] for i, m in enumerate(mask) if m]
@@ -350,15 +353,12 @@ def prep_X(df: pd.DataFrame, feature_cols: list,
         return (pd.DataFrame(X_sc, columns=live, index=X.index),
                 live, imputer, selector, scaler)
     else:
-        # Align to the columns the fitted transforms expect
-        for c in live:
-            if c not in X.columns:
-                X[c] = np.nan
-        X     = X[live]
+        # Inference path: align to exactly the columns the transforms expect
+        X = df.reindex(columns=live_cols).copy()
         X_sel = selector.transform(X)
         X_imp = imputer.transform(X_sel)
         X_sc  = scaler.transform(X_imp)
-        return pd.DataFrame(X_sc, columns=live, index=X.index)
+        return pd.DataFrame(X_sc, columns=live_cols, index=df.index)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
