@@ -432,7 +432,7 @@ def train_model(df: pd.DataFrame, model_name: str,
         make_model(model_name), X_tr, y_tr,
         cv=StratifiedKFold(n_splits=5, shuffle=True, random_state=42),
         scoring="roc_auc",
-        fit_params={"sample_weight": sw},
+        params={"sample_weight": sw},
     )
 
     return {
