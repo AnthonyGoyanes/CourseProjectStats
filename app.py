@@ -327,7 +327,15 @@ def train_model(df: pd.DataFrame, model_name: str, test_size: float,
     X = df[feature_cols].copy()
     y = df[target].copy()
 
-    # Impute missing values
+    # Drop columns that are entirely NaN — SimpleImputer silently removes them
+    # from the output array without adjusting the column list, which causes a
+    # shape mismatch when rebuilding the DataFrame.
+    all_nan_cols = [c for c in X.columns if X[c].isna().all()]
+    if all_nan_cols:
+        X = X.drop(columns=all_nan_cols)
+    feature_cols = X.columns.tolist()
+
+    # Impute remaining missing values — output shape now matches feature_cols
     imputer = SimpleImputer(strategy="median")
     X_imp = imputer.fit_transform(X)
     X_imp = pd.DataFrame(X_imp, columns=feature_cols)
@@ -720,10 +728,10 @@ with tab_train:
                 "threshold":  threshold,
             })
 
-            # Compute risk scores on full training set
-            drop_cols = {"severe_event","date"} | {c for c in df_feat.columns
-                                                   if "EVENT_TYPE" in c.upper()}
-            feat_cols = [c for c in df_feat.columns if c not in drop_cols]
+            # Compute risk scores on full dataset.
+            # Must use the exact feature_cols the model was trained on (already
+            # has all-NaN columns removed and matches the imputer's expected input).
+            feat_cols = result["feature_cols"]
             X_all = result["imputer"].transform(
                 df_feat[feat_cols].fillna(df_feat[feat_cols].median(numeric_only=True))
             )
